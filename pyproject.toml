@@ -7,7 +7,12 @@ authors = [
     { name = "Dangle", email = "le5169851@gmail.com" }
 ]
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "accelerate>=1.15.0",
+    "bitsandbytes>=0.50.2",
+    "torch>=2.14.0",
+    "transformers>=5.17.0",
+]
 
 [project.scripts]
 hallucinationllm = "hallucinationllm:main"
