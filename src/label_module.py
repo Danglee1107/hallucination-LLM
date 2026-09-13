@@ -3,7 +3,7 @@ label hallucination to response were generated (from generate_responses.py) by
 2 methods combine: Entailment (NLI fit with context) + Self-consistency
 (multiple sample, measure consistent meaning).
 
-YÊU CẦU:
+REQUIREMENT:
     pip install transformers torch sentencepiece --break-system-packages
 
 HOW TO RUN (3 stage, run sequencially):
