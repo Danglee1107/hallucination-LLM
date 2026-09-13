@@ -1,0 +1,6 @@
+accelerate
+bitsandbytes
+torch
+transformers
+pydantic
+dotenv
