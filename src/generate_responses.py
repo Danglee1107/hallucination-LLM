@@ -162,8 +162,13 @@ def run_model(model_key, records, resume=True):
     if resume and out_path.exists():
         with open(out_path, "r", encoding="utf-8") as f:
             for line in f:
-                if line.strip():
-                    done_ids.add(json.loads(line)["id"])
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                # Chỉ tính là "done" nếu attn_entropy_per_layer thực sự có dữ liệu —
+                # tránh resume bỏ qua record cũ bị lỗi/thiếu do code từng có bug (ví dụ sdpa không trả attentions).
+                if row.get("attn_entropy_per_layer"):
+                    done_ids.add(row["id"])
         print(f"Resuming: {len(done_ids)} records already done.")
 
     with open(out_path, "a", encoding="utf-8") as fout:
