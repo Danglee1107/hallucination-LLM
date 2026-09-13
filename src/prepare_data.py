@@ -1,14 +1,14 @@
 """
-Chuẩn hoá 3 domain của HaluEval (QA / Dialogue / Summarization) về schema chung:
+normalize 3 domain of HaluEval (QA / Dialogue / Summarization) to the same schema:
 
     {
         "id": str,
         "domain": "qa" | "dialogue" | "summarization",
-        "prompt": str,          # câu hỏi / lượt hội thoại cuối / yêu cầu tóm tắt
-        "context": str,         # knowledge / dialogue_history / document — dùng để label bằng entailment
-        "source_right": str,    # right_answer/response/summary gốc của HaluEval (KHÔNG dùng làm label cho model mới,
-                                 #   chỉ giữ lại để tham khảo / sanity check)
-        "source_hallucinated": str,  # tương tự, chỉ để tham khảo
+        "prompt": str,          # question / dialogue_history / text summary prompt
+        "context": str,         # QA-knowledge / dialogue-knowlege / document — dùng để label bằng entailment
+        "source_right": str,    # right_answer/response/summary HaluEval origin (not use as label,
+                                 #   just for sanity check)
+        "source_hallucinated": str,  # HaluEval origin
     }
 
 Lưu ý quan trọng: right_answer/hallucinated_answer trong HaluEval là do ChatGPT sinh,
