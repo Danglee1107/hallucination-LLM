@@ -4,3 +4,4 @@ torch
 transformers
 pydantic
 dotenv
+sentencepiece
