@@ -3,5 +3,8 @@ bitsandbytes
 torch
 transformers
 pydantic
+pydantic-settings
+huggingface-hub
 dotenv
 sentencepiece
+tdqm
