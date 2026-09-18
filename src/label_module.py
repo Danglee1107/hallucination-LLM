@@ -42,10 +42,10 @@ from transformers import (
     AutoModelForSequenceClassification,
 )
 
-from prepare_data import BASE
+from config import settings
 from generate_responses import MODEL_REGISTRY, build_chat_prompt
 
-LABEL_DIR = BASE / "data" / "processed" / "labels"
+LABEL_DIR = settings.label_dir
 
 # --- NLI config for model use Entailment (2 stage use this model) ---
 NLI_MODEL_ID = "MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli"

@@ -8,36 +8,45 @@ Gán nhãn hallucination cho response (sinh bởi generate_responses_tmp.py) b�
 Khác bản gốc:
   - NLI chạy theo lô nhiều cặp (premise, hypothesis) thay vì 1 cặp/forward,
     gom cả chunk trong 1 record lẫn nhiều record liền nhau.
-  - sample_n_responses dùng num_return_sequences thay cho N lần generate().
+  - Self-consistency sinh N sample cho nhiều prompt trong 1 lần generate
+    (B prompt × N sequence) và dồn cặp NLI của cả nhóm record vào 1 lần gọi.
+  - Chỉ đọc id/domain/response_text từ file responses (bỏ mảng hidden states),
+    mỗi id giữ bản cuối nên file responses bị trùng id không sinh nhãn trùng.
+  - --no-resume ghi đè file nhãn thay vì cộng dồn.
   - Gặp torch.OutOfMemoryError thì chia đôi lô và chạy tiếp, không chết phiên.
 
 CHẠY (3 stage, chạy tuần tự):
 
     # Stage 1 — Entailment (nhẹ, CPU hay GPU đều được, không cần load LLM)
-    uv run label_module_tmp.py --stage entailment --model qwen2.5-0.5b \
-        --responses ../data/processed/responses/qwen2.5-0.5b.jsonl \
-        --unified ../data/processed/unified_prompts.jsonl
+    uv run src/label_module_tmp.py --stage entailment --model qwen2.5-0.5b \
+        --responses data/processed/responses/qwen2.5-0.5b.jsonl \
+        --unified data/processed/unified_prompts.jsonl
 
     # Stage 2 — Self-consistency (NẶNG — load LLM để sample N lần/prompt)
-    uv run label_module_tmp.py --stage self_consistency --model llama3.1-8b \
-        --responses ../data/processed/responses/llama3.1-8b.jsonl \
-        --unified ../data/processed/unified_prompts.jsonl --n_samples 10 \
-        --nli-device cuda 
+    uv run src/label_module_tmp.py --stage self_consistency --model llama3.1-8b \
+        --responses data/processed/responses/llama3.1-8b.jsonl \
+        --unified data/processed/unified_prompts.jsonl --n_samples 10 \
+        --sample-batch-size 4 --nli-device cuda
 
     # Stage 3 — gộp 2 kết quả thành 1 nhãn
-    uv run label_module_tmp.py --stage combine --model llama3.1-8b
+    uv run src/label_module_tmp.py --stage combine --model llama3.1-8b
 
-    uv run label_module_tmp.py --self-check   # kiểm tra nhanh, không cần GPU
+    uv run src/label_module_tmp.py --self-check   # kiểm tra nhanh, không cần GPU
+
+Thêm --tag <nhãn> (lặp lại được) để đánh dấu run trên wandb khi so sánh cấu hình.
 """
 
 import argparse
 import gc
 import json
 import sys
+import tempfile
+import time
 from itertools import combinations
 from pathlib import Path
 
 import torch
+from loguru import logger
 from tqdm import tqdm
 from transformers import (
     AutoModelForCausalLM,
@@ -45,9 +54,10 @@ from transformers import (
     AutoTokenizer,
 )
 
-from config import settings
+from config import settings, tracking
 from config.logs import get_logger
 from generate_responses_tmp import MODEL_REGISTRY, build_chat_prompt
+from utils.jsonl import iter_heads
 
 log = get_logger("label_module")
 
@@ -58,9 +68,9 @@ NLI_MODEL_ID = "MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli"
 NLI_MAX_TOKENS = 400  # chunk context theo cửa sổ này (NLI model giới hạn ~512 token)
 NLI_CHUNK_STRIDE = 350  # overlap giữa các chunk để không cắt đứt câu quan trọng
 
-# Số record gom lại trước khi gọi NLI. Context QA thường chỉ 1 chunk nên nếu
-# chỉ gom trong 1 record thì lô vẫn bằng 1 và GPU rảnh.
-ENTAILMENT_RECORD_GROUP = 32
+# Số record self-consistency xử lý mỗi vòng: sample hết nhóm (chia lô theo
+# --sample-batch-size) rồi dồn toàn bộ cặp NLI của nhóm vào nli_probs 1 lần.
+SC_RECORD_GROUP = 16
 
 # --- Ngưỡng quyết định nhãn ---
 ENTAILMENT_SUPPORT_THRESHOLD = 0.5  # entailment_prob >= ngưỡng -> "được context ủng hộ"
@@ -76,6 +86,13 @@ SELF_CONSISTENCY_PAIR_ENTAIL_THRESHOLD = 0.5
 def load_jsonl(path):
     with open(path, "r", encoding="utf-8") as f:
         return [json.loads(line) for line in f if line.strip()]
+
+
+def load_responses(path, limit=None):
+    """Chỉ id/domain/response_text (bỏ qua mảng hidden states nặng hàng GB), mỗi id
+    giữ bản CUỐI — file responses cũ từng bị ghi trùng id, không lọc thì ra nhãn trùng."""
+    rows = list({r["id"]: r for r in iter_heads(Path(path))}.values())
+    return rows[:limit] if limit else rows
 
 
 def load_done_ids(path):
@@ -207,26 +224,30 @@ def run_entailment_stage(
     nli_device=None,
     fp32=False,
 ):
-    responses = load_jsonl(responses_path)
-    if limit:
-        responses = responses[:limit]
+    responses = load_responses(responses_path, limit)
     unified_by_id = {r["id"]: r for r in load_jsonl(unified_path)}
 
     out_path = LABEL_DIR / f"entailment_{model_key}.jsonl"
     done_ids = load_done_ids(out_path) if resume else set()
     todo = [r for r in responses if r["id"] not in done_ids]
-    log.info(f"entailment: {len(done_ids)} record đã xong, {len(todo)} record cần chạy")
+    slog = log.bind(stage="entailment")
+    slog.info(f"entailment: {len(done_ids)} record đã xong, {len(todo)} record cần chạy")
     if not todo:
-        return
+        return {"ok": 0, "failed": 0, "sec": 0.0}
 
     nli_tok, nli_model = load_nli(nli_device, fp32)
     state = {"size": nli_batch_size}
 
     failed = 0
+    t0 = time.perf_counter()
     bar = tqdm(total=len(todo), desc="entailment", unit="rec", dynamic_ncols=True)
-    with open(out_path, "a", encoding="utf-8") as fout:
-        for start in range(0, len(todo), ENTAILMENT_RECORD_GROUP):
-            group = todo[start : start + ENTAILMENT_RECORD_GROUP]
+    # Mỗi record có >= 1 chunk nên gom nli_batch_size record là đủ lấp đầy 1 lô NLI
+    # (QA gần như luôn 1 chunk; gom ít hơn thì lô NLI thực tế nhỏ hơn tham số).
+    group_size = nli_batch_size
+    # --no-resume phải GHI ĐÈ, "a" sẽ cộng dồn nhãn trùng id.
+    with open(out_path, "a" if resume else "w", encoding="utf-8") as fout:
+        for start in range(0, len(todo), group_size):
+            group = todo[start : start + group_size]
 
             # Trải phẳng (chunk, response) của cả nhóm record thành 1 danh sách cặp,
             # nhớ owner để gom lại sau. Nhờ vậy record 1 chunk vẫn chạy full lô.
@@ -234,7 +255,7 @@ def run_entailment_stage(
             for resp in group:
                 record = unified_by_id.get(resp["id"])
                 if record is None:
-                    log.warning(
+                    slog.warning(
                         f"entailment: không thấy context cho id={resp['id']}, bỏ qua"
                     )
                     failed += 1
@@ -254,7 +275,7 @@ def run_entailment_stage(
             for resp, chunk_probs in zip(usable, by_owner):
                 best = best_chunk_scores(chunk_probs)
                 if best is None:
-                    log.warning(
+                    slog.warning(
                         f"entailment: id={resp['id']} không chunk nào chạy được, bỏ qua"
                     )
                     failed += 1
@@ -284,76 +305,80 @@ def run_entailment_stage(
                 bar.update(1)
             fout.flush()
             bar.set_postfix(batch=state["size"], failed=failed)
+            # nli_batch theo dõi luôn kích thước lô THỰC TẾ sau khi map_batched tự
+            # giảm vì OOM — số này quyết định throughput, đừng chỉ nhìn tham số CLI.
+            tracking.log_metrics(
+                {
+                    "entailment/records_done": bar.n,
+                    "entailment/failed": failed,
+                    "entailment/rec_per_s": bar.n / (time.perf_counter() - t0),
+                    "entailment/nli_batch": state["size"],
+                }
+            )
 
     bar.close()
-    log.info(f"entailment xong: {len(todo) - failed} ok, {failed} lỗi -> {out_path}")
+    sec = time.perf_counter() - t0
+    slog.info(
+        f"entailment xong: {len(todo) - failed} ok, {failed} lỗi, {sec:.0f}s -> {out_path}"
+    )
+    return {"ok": len(todo) - failed, "failed": failed, "sec": round(sec, 1)}
 
 
 # STAGE 2: SELF-CONSISTENCY
 @torch.inference_mode()
-def sample_n_responses(
-    model,
-    tokenizer,
-    messages,
-    n_samples,
-    state,
-    max_new_tokens=256,
-    temperature=0.7,
-    top_p=0.9,
+def sample_batch(
+    model, tokenizer, records, n_samples, max_new_tokens=256, temperature=0.7, top_p=0.9
 ):
-    """Sample N response khác nhau cho cùng 1 prompt bằng num_return_sequences
-    (1 lần generate thay vì N lần). Đây là mẫu để đo độ nhất quán, KHÔNG phải
-    response chính thức (đã có ở generate_responses_tmp.py)."""
-    encoded = tokenizer.apply_chat_template(
-        messages, add_generation_prompt=True, return_tensors="pt", return_dict=True
-    ).to(model.device)
-    input_ids = encoded["input_ids"]
-    prompt_len = input_ids.shape[1]
-
-    def run(sub):
-        generated = model.generate(
-            input_ids,
-            attention_mask=encoded.get("attention_mask"),
-            max_new_tokens=max_new_tokens,
-            do_sample=True,
-            temperature=temperature,
-            top_p=top_p,
-            num_return_sequences=len(sub),
-            pad_token_id=tokenizer.eos_token_id,
+    """N sample cho MỖI record trong 1 lần generate: B prompt × N sequence.
+    Trước đây 1 prompt/lần nên lô chỉ có N sequence và GPU rảnh phần lớn thời gian.
+    Đây là mẫu để đo độ nhất quán, KHÔNG phải response chính thức."""
+    texts = [
+        tokenizer.apply_chat_template(
+            build_chat_prompt(r), add_generation_prompt=True, tokenize=False
         )
-        return [
-            tokenizer.decode(seq[prompt_len:], skip_special_tokens=True)
-            for seq in generated
-        ]
-
-    texts = map_batched(run, list(range(n_samples)), state, "sample")
-    return [t for t in texts if t is not None]
-
-
-def consistency_score(samples, nli_tok, nli_model, state):
-    """Tỉ lệ cặp sample 'nhất quán'. Nhất quán = 2 sample entail LẪN NHAU (cả 2 chiều),
-    giống ý tưởng gom cụm theo semantic entailment trong semantic entropy."""
-    if len(samples) < 2:
-        return 1.0
-    pairs = list(combinations(samples, 2))
-    # Cả 2 chiều đưa vào 1 lô: nửa đầu a->b, nửa sau b->a.
-    probs = nli_probs(
-        [(a, b) for a, b in pairs] + [(b, a) for a, b in pairs],
-        nli_tok,
-        nli_model,
-        state,
+        for r in records
+    ]
+    # add_special_tokens=False: chat template đã chèn BOS rồi, thêm nữa là lặp.
+    encoded = tokenizer(
+        texts, return_tensors="pt", padding=True, add_special_tokens=False
+    ).to(model.device)
+    generated = model.generate(
+        **encoded,
+        max_new_tokens=max_new_tokens,
+        do_sample=True,
+        temperature=temperature,
+        top_p=top_p,
+        num_return_sequences=n_samples,
+        pad_token_id=tokenizer.pad_token_id,
     )
+    # generate xếp output theo prompt: [p0s0 .. p0s(N-1), p1s0, ...]. Pad/EOS ở
+    # đuôi là special token nên skip_special_tokens bỏ luôn.
+    out = tokenizer.batch_decode(
+        generated[:, encoded["input_ids"].shape[1] :], skip_special_tokens=True
+    )
+    return [out[k * n_samples : (k + 1) * n_samples] for k in range(len(records))]
 
-    scores = []
-    for k in range(len(pairs)):
-        forward, backward = probs[k], probs[len(pairs) + k]
-        if forward is None or backward is None:
-            continue
-        scores.append(min(forward[0], backward[0]))  # entail prob 2 chiều
-    if not scores:
-        raise RuntimeError("không cặp nào chạy được NLI")
-    consistent = sum(1 for s in scores if s >= SELF_CONSISTENCY_PAIR_ENTAIL_THRESHOLD)
-    return consistent / len(scores)
+
+def consistency_scores(sample_groups, nli_fn):
+    """Mỗi nhóm sample -> tỉ lệ cặp 'nhất quán' (None nếu không cặp nào chạy được NLI).
+    Nhất quán = 2 sample entail LẪN NHAU (cả 2 chiều), giống ý tưởng gom cụm theo
+    semantic entailment trong semantic entropy. Cặp của MỌI nhóm dồn vào 1 lần
+    nli_fn để lô NLI đầy. nli_fn: list (premise, hypothesis) -> list probs | None."""
+    pairs, owners = [], []
+    for k, samples in enumerate(sample_groups):
+        for a, b in combinations(samples, 2):
+            pairs += [(a, b), (b, a)]  # 2 chiều đứng liền nhau
+            owners.append(k)
+    probs = nli_fn(pairs)
+
+    agree = [[] for _ in sample_groups]
+    for k, fwd, bwd in zip(owners, probs[0::2], probs[1::2]):
+        if fwd is not None and bwd is not None:  # None = cặp OOM ở lô 1 cặp
+            agree[k].append(min(fwd[0], bwd[0]) >= SELF_CONSISTENCY_PAIR_ENTAIL_THRESHOLD)
+    return [
+        1.0 if len(samples) < 2 else (sum(a) / len(a) if a else None)
+        for samples, a in zip(sample_groups, agree)
+    ]
 
 
 def run_self_consistency_stage(
@@ -364,27 +389,29 @@ def run_self_consistency_stage(
     limit=None,
     resume=True,
     nli_batch_size=16,
-    sample_batch_size=None,
+    sample_batch_size=4,
     nli_device=None,
     fp32=False,
 ):
-    responses = load_jsonl(responses_path)
-    if limit:
-        responses = responses[:limit]
+    responses = load_responses(responses_path, limit)
     unified_by_id = {r["id"]: r for r in load_jsonl(unified_path)}
 
     out_path = LABEL_DIR / f"self_consistency_{model_key}.jsonl"
     done_ids = load_done_ids(out_path) if resume else set()
     todo = [r for r in responses if r["id"] not in done_ids]
-    log.info(
+    slog = log.bind(stage="self_consistency")
+    slog.info(
         f"self_consistency: {len(done_ids)} record đã xong, {len(todo)} record cần chạy"
     )
     if not todo:
-        return
+        return {"ok": 0, "failed": 0, "sec": 0.0}
 
     cfg = MODEL_REGISTRY[model_key]
-    log.info(f"loading {model_key} ({cfg['repo_id']})")
+    slog.info(f"loading {model_key} ({cfg['repo_id']})")
     tokenizer = AutoTokenizer.from_pretrained(cfg["repo_id"])
+    tokenizer.padding_side = "left"  # bắt buộc cho generate theo batch
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token  # llama không có pad token
     model = AutoModelForCausalLM.from_pretrained(
         cfg["repo_id"],
         device_map="auto",
@@ -395,27 +422,51 @@ def run_self_consistency_stage(
 
     nli_tok, nli_model = load_nli(nli_device, fp32)
     nli_state = {"size": nli_batch_size}
-    sample_state = {"size": sample_batch_size or n_samples}
+    sample_state = {"size": sample_batch_size}  # số PROMPT mỗi lần generate
+
+    def nli_fn(pairs):
+        return nli_probs(pairs, nli_tok, nli_model, nli_state)
+
+    def sample_fn(items):
+        return sample_batch(model, tokenizer, [rec for _, rec in items], n_samples)
 
     failed = 0
+    t0 = time.perf_counter()
     bar = tqdm(total=len(todo), desc="self_consistency", unit="rec", dynamic_ncols=True)
-    with open(out_path, "a", encoding="utf-8") as fout:
-        for resp in todo:
-            record = unified_by_id.get(resp["id"])
-            if record is None:
-                log.warning(
-                    f"self_consistency: không thấy prompt cho id={resp['id']}, bỏ qua"
-                )
-                failed += 1
-                bar.update(1)
-                continue
+    items = []
+    for resp in todo:
+        record = unified_by_id.get(resp["id"])
+        if record is None:
+            slog.warning(f"self_consistency: không thấy prompt cho id={resp['id']}, bỏ qua")
+            failed += 1
+            bar.update(1)
+        else:
+            items.append((resp, record))
+    # Prompt dài đi với prompt dài: đỡ pad trái. Batch size chỉ giảm khi OOM, mà
+    # prompt dài dồn về cuối, nên các lô đầu vẫn chạy ở batch size lớn nhất.
+    items.sort(key=lambda it: len(it[1]["context"]) + len(it[1]["prompt"]))
+
+    with open(out_path, "a" if resume else "w", encoding="utf-8") as fout:
+        for start in range(0, len(items), SC_RECORD_GROUP):
+            group = items[start : start + SC_RECORD_GROUP]
             try:
-                samples = sample_n_responses(
-                    model, tokenizer, build_chat_prompt(record), n_samples, sample_state
-                )
-                if not samples:
-                    raise RuntimeError("không sample được response nào")
-                score = consistency_score(samples, nli_tok, nli_model, nli_state)
+                # None = prompt vẫn OOM ở lô 1 prompt
+                sample_groups = [
+                    g or [] for g in map_batched(sample_fn, group, sample_state, "sample")
+                ]
+                scores = consistency_scores(sample_groups, nli_fn)
+            except Exception:
+                failed += len(group)
+                slog.exception(f"self_consistency: lỗi ở nhóm bắt đầu từ id={group[0][0]['id']}")
+                free_cuda()
+                bar.update(len(group))
+                continue
+
+            for (resp, _), samples, score in zip(group, sample_groups, scores):
+                if not samples or score is None:
+                    failed += 1
+                    slog.warning(f"self_consistency: id={resp['id']} không sample/NLI được, bỏ qua")
+                    continue
                 fout.write(
                     json.dumps(
                         {
@@ -434,23 +485,33 @@ def run_self_consistency_stage(
                     )
                     + "\n"
                 )
-                fout.flush()
-            except Exception:
-                failed += 1
-                log.exception(f"self_consistency: lỗi ở id={resp['id']}")
-                free_cuda()
-            bar.update(1)
+            fout.flush()
+            bar.update(len(group))
             bar.set_postfix(
                 sample=sample_state["size"], nli=nli_state["size"], failed=failed
             )
+            tracking.log_metrics(
+                {
+                    "self_consistency/records_done": bar.n,
+                    "self_consistency/failed": failed,
+                    "self_consistency/rec_per_s": bar.n / (time.perf_counter() - t0),
+                    "self_consistency/sample_batch": sample_state["size"],
+                    "self_consistency/nli_batch": nli_state["size"],
+                    "self_consistency/vram_peak_gb": tracking.vram_peak_gb(),
+                }
+            )
 
     bar.close()
-    del model, tokenizer, nli_model
+    # Gán None thay vì del: nli_fn/sample_fn giữ closure tới các biến này.
+    model = tokenizer = nli_model = None
     gc.collect()
     free_cuda()
-    log.info(
-        f"self_consistency xong: {len(todo) - failed} ok, {failed} lỗi -> {out_path}"
+    sec = time.perf_counter() - t0
+    slog.info(
+        f"self_consistency xong: {len(todo) - failed} ok, {failed} lỗi, {sec:.0f}s "
+        f"-> {out_path}"
     )
+    return {"ok": len(todo) - failed, "failed": failed, "sec": round(sec, 1)}
 
 
 # STAGE 3: COMBINE
@@ -467,11 +528,13 @@ def run_combine_stage(model_key):
     ent_by_id = {r["id"]: r for r in load_jsonl(ent_path)}
     sc_by_id = {r["id"]: r for r in load_jsonl(sc_path)}
     common_ids = sorted(set(ent_by_id) & set(sc_by_id))
-    log.info(
+    slog = log.bind(stage="combine")
+    slog.info(
         f"combine: {len(common_ids)} id có đủ 2 nhãn (entailment ∩ self_consistency)"
     )
 
     counts = {"hallucination": 0, "not_hallucination": 0, "disagreement": 0}
+    samples = []  # vài chục dòng đầu để xem định tính trên wandb
     with open(out_path, "w", encoding="utf-8") as f:
         for rid in common_ids:
             ent, sc = ent_by_id[rid], sc_by_id[rid]
@@ -488,6 +551,17 @@ def run_combine_stage(model_key):
                     "low",
                 )  # cần review tay trên subset nhỏ
             counts[final_label] += 1
+            if len(samples) < 50:
+                samples.append(
+                    [
+                        rid,
+                        ent["domain"],
+                        round(ent["entailment_prob"], 3),
+                        round(ent["contradiction_prob"], 3),
+                        round(sc["consistency_score"], 3),
+                        final_label,
+                    ]
+                )
 
             f.write(
                 json.dumps(
@@ -510,8 +584,20 @@ def run_combine_stage(model_key):
 
     total = len(common_ids) or 1
     for label, n in counts.items():
-        log.info(f"combine: {label}: {n} ({n / total:.1%})")
-    log.info(f"combine xong -> {out_path}")
+        slog.info(f"combine: {label}: {n} ({n / total:.1%})")
+    slog.info(f"combine xong -> {out_path}")
+
+    tracking.log_metrics(
+        {f"combine/{label}": n for label, n in counts.items()}
+        | {f"combine/{label}_ratio": n / total for label, n in counts.items()}
+    )
+    tracking.log_bar("combine/label_distribution", counts)
+    tracking.log_table(
+        "combine/samples",
+        ["id", "domain", "entail_p", "contra_p", "consistency", "final_label"],
+        samples,
+    )
+    return {"total": len(common_ids), **counts}
 
 
 def self_check():
@@ -553,9 +639,33 @@ def self_check():
     assert best_chunk_scores(probs) == (0.6, 0.05)  # không phải (0.9, 0.05)
     assert best_chunk_scores([None]) is None
 
+    # consistency_scores: fake NLI entail cặp khi 2 câu cùng chữ cái đầu
+    def fake_nli(pairs):
+        return [[0.9, 0.05, 0.05] if a[0] == b[0] else [0.1, 0.1, 0.8] for a, b in pairs]
+
+    got = consistency_scores([["a1", "a2", "b1"], ["x"], ["c1", "c2"]], fake_nli)
+    assert got == [1 / 3, 1.0, 1.0], got  # nhóm 1: chỉ cặp (a1, a2) nhất quán
+    assert consistency_scores([["a", "b"]], lambda pairs: [None] * len(pairs)) == [None]
+
+    # load_responses: giữ bản cuối mỗi id, không đọc mảng hidden states
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "r.jsonl"
+        path.write_text(
+            "".join(
+                json.dumps({"id": i, "response_text": t, "hidden_states_per_layer": [[1.0]]}) + "\n"
+                for i, t in [("q1", "old"), ("q2", "x"), ("q1", "new")]
+            )
+        )
+        rows = load_responses(path)
+        assert [(r["id"], r["response_text"]) for r in rows] == [("q1", "new"), ("q2", "x")]
+        assert "hidden_states_per_layer" not in rows[0]
+
     print("self-check OK")
 
 
+# logger.catch: lỗi ở main vẫn vào file log kèm traceback dù thư viện khác có
+# ghi đè sys.excepthook. default=1 để `sys.exit(main())` trả mã lỗi khác 0.
+@logger.catch(default=1)
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -577,29 +687,40 @@ def main():
     parser.add_argument(
         "--sample-batch-size",
         type=int,
-        default=None,
-        help="Số sample mỗi lần generate (mặc định = --n_samples)",
+        default=4,
+        # ponytail: mỗi prompt nhân N sequence và HF không chia sẻ KV prefix giữa
+        # chúng, nên VRAM ~ B × N × (prompt + max_new_tokens). OOM thì tự chia đôi.
+        help="Số PROMPT mỗi lần generate, mỗi prompt sinh --n_samples sequence",
     )
     parser.add_argument("--nli-device", choices=["cuda", "cpu"], default=None)
     parser.add_argument("--fp32", action="store_true", help="Tắt bf16 cho NLI")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--tag", action="append", default=[], help="Tag cho wandb run, lặp lại được"
+    )
     parser.add_argument("--self-check", action="store_true")
     args = parser.parse_args()
 
     if args.self_check:
         self_check()
-        return
+        return 0
     if not args.stage or not args.model:
         parser.error("--stage và --model là bắt buộc")
 
+    tracking.set_seed(args.seed)
+    info = tracking.runtime_info(args.seed)
+    log.info(f"runtime: {info}")
+    tracking.init_run(f"label_{args.stage}", {**vars(args), **info}, tags=args.tag)
+
     if args.stage == "combine":
-        run_combine_stage(args.model)
-        return
+        tracking.finish(run_combine_stage(args.model))
+        return 0
 
     if not args.responses or not args.unified:
         parser.error(f"stage {args.stage} cần --responses và --unified")
 
     if args.stage == "entailment":
-        run_entailment_stage(
+        stats = run_entailment_stage(
             args.model,
             Path(args.responses),
             Path(args.unified),
@@ -610,7 +731,7 @@ def main():
             fp32=args.fp32,
         )
     else:
-        run_self_consistency_stage(
+        stats = run_self_consistency_stage(
             args.model,
             Path(args.responses),
             Path(args.unified),
@@ -622,6 +743,8 @@ def main():
             nli_device=args.nli_device,
             fp32=args.fp32,
         )
+    tracking.finish(stats)
+    return 0
 
 
 if __name__ == "__main__":

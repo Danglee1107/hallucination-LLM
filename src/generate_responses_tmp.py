@@ -9,25 +9,33 @@ Vì sao batch: decode greedy 1 sequence bị chặn bởi memory bandwidth, mỗ
 đọc toàn bộ weight từ VRAM trong khi SM gần như rảnh. Batch B chia chi phí đọc
 weight cho B sequence nên throughput tăng gần tuyến tính.
 
+File output: sinh theo thứ tự độ dài prompt (đỡ pad) nhưng cuối mỗi run được dọn
+lại theo thứ tự input, mỗi id đúng 1 dòng (bản mới nhất). --no-resume ghi đè file.
+
 Chạy:
     uv run src/generate_responses_tmp.py --model qwen2.5-0.5b --input data/processed/unified_prompts.jsonl --batch-size 16
     uv run src/generate_responses_tmp.py --model all --input data/processed/unified_prompts.jsonl --batch-size 16
     uv run src/generate_responses_tmp.py --self-check   # kiểm tra nhanh phần toán, không cần GPU
     uv run src/generate_responses_tmp.py --model qwen2.5-0.5b --input data/processed/unified_prompts.jsonl --limit 8 --no-resume --batch-size 8
+    uv run src/generate_responses_tmp.py --model qwen2.5-0.5b --input ... --tag baseline --tag bs16   # gắn nhãn run trên wandb
 """
 
 import argparse
 import gc
 import json
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 import torch
+from loguru import logger
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from config import settings
+from config import settings, tracking
 from config.logs import get_logger
+from utils.jsonl import compact_jsonl, head
 
 log = get_logger("generate_responses")
 
@@ -97,18 +105,17 @@ def token_stats(logits):
 
 def done_ids(out_path: Path) -> set:
     """Id đã sinh xong. Chỉ tính là done khi attn_entropy_per_layer có dữ liệu —
-    tránh resume bỏ qua record cũ bị lỗi/thiếu."""
+    tránh resume bỏ qua record cũ bị lỗi/thiếu. Kiểm tra trên bytes + head() để
+    không parse hàng GB mảng float chỉ để lấy id."""
     if not out_path.exists():
         return set()
-    ids = set()
-    with open(out_path, "r", encoding="utf-8") as f:
-        for line in f:
-            if not line.strip():
-                continue
-            row = json.loads(line)
-            if row.get("attn_entropy_per_layer"):
-                ids.add(row["id"])
-    return ids
+    with open(out_path, "rb") as f:
+        return {
+            head(line)["id"]
+            for line in f
+            if b'"attn_entropy_per_layer": [' in line
+            and b'"attn_entropy_per_layer": []' not in line
+        }
 
 
 def cut_response(gen_ids, eos):
@@ -217,11 +224,14 @@ def analyze_chunk(model, pad_id, pairs):
         start, end = prompt_ids.numel(), lens[i]
 
         # hidden_states: tuple(num_layers+1) of [batch, seq_len, hidden_dim]
-        # mean-pool riêng phần RESPONSE cho từng layer
-        hidden = [
-            layer_hs[i, start:end, :].mean(dim=0).float().cpu().tolist()
-            for layer_hs in outputs.hidden_states
-        ]
+        # mean-pool riêng phần RESPONSE cho từng layer. Stack rồi chép về CPU 1 lần
+        # thay vì 1 lần/layer (mỗi lần là 1 lần đồng bộ GPU).
+        hidden = (
+            torch.stack([hs[i, start:end, :].mean(dim=0) for hs in outputs.hidden_states])
+            .float()
+            .cpu()
+            .tolist()
+        )
 
         # logit tại t dự đoán token t+1 -> lùi 1 vị trí
         confidence, entropy = token_stats(outputs.logits[i, start - 1 : end - 1, :])
@@ -231,7 +241,8 @@ def analyze_chunk(model, pad_id, pairs):
         attn = []
         for layer_attn in outputs.attentions:  # [batch, num_heads, seq_len, seq_len]
             a = layer_attn[i, :, start:end, : lens[i]].float().clamp_min(1e-12)
-            attn.append((-(a * a.log()).sum(dim=-1)).mean().item())
+            attn.append((-(a * a.log()).sum(dim=-1)).mean())
+        attn = torch.stack(attn).tolist()
 
         results.append(
             {
@@ -244,6 +255,14 @@ def analyze_chunk(model, pad_id, pairs):
     return results
 
 
+def compact(out_path, records, slog):
+    """Sinh theo thứ tự độ dài (đỡ pad) nhưng file cuối phải theo thứ tự input
+    và mỗi id 1 dòng: người đọc file / ghép theo dòng không bị lệch."""
+    if out_path.exists():
+        dropped = compact_jsonl(out_path, [r["id"] for r in records])
+        slog.info(f"dọn {out_path.name}: theo thứ tự input, bỏ {dropped} dòng trùng id")
+
+
 def run_model(
     model_key,
     records,
@@ -254,19 +273,22 @@ def run_model(
 ):
     cfg = MODEL_REGISTRY[model_key]
     out_path = settings.responses_dir / f"{model_key}.jsonl"
+    slog = log.bind(stage=model_key)  # mọi dòng log dưới đây có nhãn model
 
     # Lọc trước khi load model: nếu xong hết thì khỏi tốn thời gian load weights.
     done = done_ids(out_path) if resume else set()
     todo = [r for r in records if r["id"] not in done]
-    log.info(f"{model_key}: {len(done)} record đã xong, {len(todo)} record cần chạy")
+    slog.info(f"{model_key}: {len(done)} record đã xong, {len(todo)} record cần chạy")
     if not todo:
-        return
+        # Vẫn dọn file: sửa được file cũ bị trùng id / sai thứ tự mà không load model.
+        compact(out_path, records, slog)
+        return {"ok": 0, "failed": 0, "sec": 0.0}
 
     # Gom record dài với record dài: prompt summarization dài hơn QA nhiều lần,
     # trộn chung thì phần lớn batch là pad. Đếm ký tự đủ dùng, khỏi tokenize 2 lần.
     todo.sort(key=lambda r: len(r["context"]) + len(r["prompt"]))
 
-    log.info(f"loading {model_key} ({cfg['repo_id']})")
+    slog.info(f"loading {model_key} ({cfg['repo_id']})")
     tokenizer = AutoTokenizer.from_pretrained(cfg["repo_id"])
     tokenizer.padding_side = "left"  # bắt buộc cho decode theo batch
     if tokenizer.pad_token is None:
@@ -281,8 +303,24 @@ def run_model(
     switchable = probe_attn_switch(model)
 
     failed = 0
+    n_tokens = 0
+    t0 = time.perf_counter()
     bar = tqdm(total=len(todo), desc=model_key, unit="rec", dynamic_ncols=True)
-    with open(out_path, "a", encoding="utf-8") as fout:
+
+    def log_progress():
+        """Throughput + VRAM đỉnh lên wandb để so sánh giữa các lần chạy/cấu hình."""
+        elapsed = time.perf_counter() - t0
+        tracking.log_metrics(
+            {
+                f"{model_key}/records_done": bar.n,
+                f"{model_key}/failed": failed,
+                f"{model_key}/rec_per_s": bar.n / elapsed,
+                f"{model_key}/tokens_per_s": n_tokens / elapsed,
+                f"{model_key}/vram_peak_gb": tracking.vram_peak_gb(),
+            }
+        )
+    # --no-resume phải GHI ĐÈ. Trước đây luôn "a" nên chạy lại cộng dồn bản trùng id.
+    with open(out_path, "a" if resume else "w", encoding="utf-8") as fout:
         for start in range(0, len(todo), batch_size):
             batch = todo[start : start + batch_size]
             try:
@@ -291,16 +329,18 @@ def run_model(
                 set_attn(model, "eager", switchable)
             except torch.cuda.OutOfMemoryError:
                 failed += len(batch)
-                log.exception(
+                slog.exception(
                     f"OOM lúc generate, giảm --batch-size (hiện {batch_size})"
                 )
                 torch.cuda.empty_cache()
                 bar.update(len(batch))
+                log_progress()
                 continue
             except Exception:
                 failed += len(batch)
-                log.exception(f"lỗi generate ở batch bắt đầu từ {batch[0]['id']}")
+                slog.exception(f"lỗi generate ở batch bắt đầu từ {batch[0]['id']}")
                 bar.update(len(batch))
+                log_progress()
                 continue
 
             for j in range(0, len(batch), analysis_batch_size):
@@ -311,7 +351,9 @@ def run_model(
                 keep = [k for k, (_, r) in enumerate(sub_pairs) if r.numel() > 0]
                 failed += n_sub - len(keep)
                 for k in set(range(n_sub)) - set(keep):
-                    log.warning(f"record {sub_records[k]['id']}: response rỗng, bỏ qua")
+                    slog.warning(
+                        f"record {sub_records[k]['id']}: response rỗng, bỏ qua"
+                    )
                 if not keep:
                     bar.update(n_sub)
                     continue
@@ -322,16 +364,17 @@ def run_model(
                     rows = analyze_chunk(model, tokenizer.pad_token_id, sub_pairs)
                 except torch.cuda.OutOfMemoryError:
                     failed += len(sub_pairs)
-                    log.exception("OOM lúc phân tích, giảm --analysis-batch-size")
+                    slog.exception("OOM lúc phân tích, giảm --analysis-batch-size")
                     torch.cuda.empty_cache()
                     bar.update(n_sub)
                     continue
                 except Exception:
                     failed += len(sub_pairs)
-                    log.exception(f"lỗi phân tích ở record {sub_records[0]['id']}")
+                    slog.exception(f"lỗi phân tích ở record {sub_records[0]['id']}")
                     bar.update(n_sub)
                     continue
 
+                n_tokens += sum(r.numel() for _, r in sub_pairs)
                 for record, (_, response_ids), row in zip(sub_records, sub_pairs, rows):
                     fout.write(
                         json.dumps(
@@ -352,12 +395,20 @@ def run_model(
                 bar.update(n_sub)
                 bar.set_postfix(failed=failed)
 
+            log_progress()
+
     bar.close()
     del model, tokenizer
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    log.info(f"xong {model_key}: {len(todo) - failed} ok, {failed} lỗi -> {out_path}")
+    compact(out_path, records, slog)
+    sec = time.perf_counter() - t0
+    slog.info(
+        f"xong {model_key}: {len(todo) - failed} ok, {failed} lỗi, {sec:.0f}s, "
+        f"VRAM đỉnh {tracking.vram_peak_gb()} GB -> {out_path}"
+    )
+    return {"ok": len(todo) - failed, "failed": failed, "sec": round(sec, 1)}
 
 
 def self_check():
@@ -396,9 +447,33 @@ def self_check():
     assert mask.tolist() == [[1, 1, 1], [1, 1, 0]]
     # chỉ số cắt response dùng cho analyze_chunk: prompt_len=1 -> response = [2, 3]
     assert ids[0, 1 : lens[0]].tolist() == [2, 3]
+
+    # head(): chuỗi giống key nặng nằm TRONG response_text (đã escape) không được cắt nhầm
+    tricky = 'x", "hidden_states_per_layer": [1]'
+    row = {"id": "a", "response_text": tricky, "hidden_states_per_layer": [[0.5]]}
+    assert head(json.dumps(row).encode())["response_text"] == tricky
+
+    # compact_jsonl: giữ bản cuối mỗi id, theo thứ tự input, id lạ xếp sau,
+    # dòng cuối file thiếu \n vẫn tách dòng đúng; resume đọc được file sau khi dọn
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "r.jsonl"
+        rows = [("b", 1, [1.0]), ("a", 1, [1.0]), ("b", 2, [1.0]), ("z", 1, []), ("c", 1, [1.0])]
+        path.write_text(
+            "\n".join(
+                json.dumps({"id": i, "v": v, "hidden_states_per_layer": [], "attn_entropy_per_layer": a})
+                for i, v, a in rows
+            )
+        )
+        assert compact_jsonl(path, ["a", "b", "c"]) == 1
+        got = [(r["id"], r["v"]) for r in map(json.loads, path.read_text().splitlines())]
+        assert got == [("a", 1), ("b", 2), ("c", 1), ("z", 1)], got
+        assert done_ids(path) == {"a", "b", "c"}  # z có attn rỗng -> chưa xong
     print("self-check OK")
 
 
+# logger.catch: lỗi ở main vẫn vào file log kèm traceback dù thư viện khác có
+# ghi đè sys.excepthook. default=1 để `sys.exit(main())` trả mã lỗi khác 0.
+@logger.catch(default=1)
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", choices=list(MODEL_REGISTRY) + ["all"])
@@ -417,14 +492,23 @@ def main():
         help="Số record mỗi forward pass phân tích (tốn VRAM theo T²)",
     )
     parser.add_argument("--no-resume", action="store_true")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--tag", action="append", default=[], help="Tag cho wandb run, lặp lại được"
+    )
     parser.add_argument("--self-check", action="store_true")
     args = parser.parse_args()
 
     if args.self_check:
         self_check()
-        return
+        return 0
     if not args.model or not args.input:
         parser.error("--model và --input là bắt buộc")
+
+    tracking.set_seed(args.seed)
+    info = tracking.runtime_info(args.seed)
+    log.info(f"runtime: {info}")
+    tracking.init_run("generate_responses", {**vars(args), **info}, tags=args.tag)
 
     records = load_jsonl(args.input)
     if args.limit:
@@ -432,8 +516,9 @@ def main():
     log.info(f"nạp {len(records)} record từ {args.input}")
 
     targets = list(MODEL_REGISTRY) if args.model == "all" else [args.model]
+    summary = {}
     for model_key in targets:
-        run_model(
+        stats = run_model(
             model_key,
             records,
             max_new_tokens=args.max_new_tokens,
@@ -441,6 +526,9 @@ def main():
             analysis_batch_size=args.analysis_batch_size,
             resume=not args.no_resume,
         )
+        summary.update({f"{model_key}/{k}": v for k, v in stats.items()})
+    tracking.finish(summary)
+    return 0
 
 
 if __name__ == "__main__":

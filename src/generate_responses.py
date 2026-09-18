@@ -12,8 +12,8 @@ REQUIREMENT:
     huggingface-cli login   # cần cho Llama-3.1, Llama-2, Gemma-2 (gated models)
 
 how to run:
-    python generate_responses.py --model llama3.1-8b --input ../data/processed/unified_prompts.jsonl
-    python generate_responses.py --model all --input ../data/processed/unified_prompts.jsonl
+    uv run generate_responses.py --model llama3.1-8b --input ../data/processed/unified_prompts.jsonl
+    uv run generate_responses.py --model all --input ../data/processed/unified_prompts.jsonl
 """
 
 import json
@@ -21,12 +21,13 @@ import argparse
 import gc
 import traceback
 from pathlib import Path
-from prepare_data import BASE
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-OUT_DIR = BASE / "data" / "processed" / "responses"
+from config import settings
+
+OUT_DIR = settings.responses_dir
 
 # HuggingFace repo id cho từng model.
 # Llama/Gemma là gated -> cần HF_TOKEN đã login trước.
@@ -51,7 +52,6 @@ MODEL_REGISTRY = {
         "repo_id": "meta-llama/Llama-2-13b-chat-hf",
         "load_kwargs": {"load_in_8bit": True},
     },
-
     # --- DEMO ---
     "qwen2.5-0.5b": {
         "repo_id": "Qwen/Qwen2.5-0.5B-Instruct",
@@ -87,7 +87,8 @@ def build_chat_prompt(record):
 @torch.no_grad()
 def generate_with_internals(model, tokenizer, messages, max_new_tokens=256):
     """Generate response, sau đó chạy 1 forward pass riêng trên (input+response)
-    để lấy hidden_states/attentions/logits ổn định (tránh phải giữ cache qua từng bước generate)."""
+    để lấy hidden_states/attentions/logits ổn định (tránh phải giữ cache qua từng bước generate).
+    """
     encoded = tokenizer.apply_chat_template(
         messages, add_generation_prompt=True, return_tensors="pt", return_dict=True
     ).to(model.device)
@@ -101,7 +102,7 @@ def generate_with_internals(model, tokenizer, messages, max_new_tokens=256):
         do_sample=False,
         pad_token_id=tokenizer.eos_token_id,
     )
-    response_ids = gen_out[0][input_ids.shape[1]:]
+    response_ids = gen_out[0][input_ids.shape[1] :]
     response_text = tokenizer.decode(response_ids, skip_special_tokens=True)
 
     # Forward pass riêng lấy internal states cho full sequence (prompt + response)
@@ -121,7 +122,9 @@ def generate_with_internals(model, tokenizer, messages, max_new_tokens=256):
     ]
 
     # logit-based confidence: mean top-1 probability của response tokens
-    logits = outputs.logits[0, prompt_len - 1:-1, :]  # align: logit tại t dự đoán token t+1
+    logits = outputs.logits[
+        0, prompt_len - 1 : -1, :
+    ]  # align: logit tại t dự đoán token t+1
     probs = torch.softmax(logits.float(), dim=-1)
     top1_probs = probs.max(dim=-1).values
     mean_confidence = top1_probs.mean().item()
@@ -151,7 +154,10 @@ def run_model(model_key, records, resume=True):
 
     tokenizer = AutoTokenizer.from_pretrained(cfg["repo_id"])
     model = AutoModelForCausalLM.from_pretrained(
-        cfg["repo_id"], device_map="auto", attn_implementation="eager", **cfg["load_kwargs"]
+        cfg["repo_id"],
+        device_map="auto",
+        attn_implementation="eager",
+        **cfg["load_kwargs"],
     )
     model.eval()
 
@@ -201,16 +207,21 @@ def run_model(model_key, records, resume=True):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", required=True,
-                         choices=list(MODEL_REGISTRY.keys()) + ["all"])
+    parser.add_argument(
+        "--model", required=True, choices=list(MODEL_REGISTRY.keys()) + ["all"]
+    )
     parser.add_argument("--input", required=True, help="Path to unified_prompts.jsonl")
-    parser.add_argument("--limit", type=int, default=None,
-                         help="Optional: only process first N records (quick test)")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Optional: only process first N records (quick test)",
+    )
     args = parser.parse_args()
 
     records = load_jsonl(args.input)
     if args.limit:
-        records = records[:args.limit]
+        records = records[: args.limit]
 
     targets = list(MODEL_REGISTRY.keys()) if args.model == "all" else [args.model]
     for model_key in targets:

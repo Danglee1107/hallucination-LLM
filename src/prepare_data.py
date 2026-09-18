@@ -20,15 +20,12 @@ dùng "context" ở đây làm nguồn đối chiếu.
 
 import json
 import argparse
-from pathlib import Path
 
-BASE = Path(__file__).resolve().parent.parent
+from config import BASE_DIR as BASE
+from config import settings
 
-RAW_DIR = BASE / "data" / "raw" / "halueval" / "data"
-OUT_DIR = BASE / "data" / "processed"
-
-RAW_DIR.mkdir(parents=True, exist_ok=True)
-OUT_DIR.mkdir(parents=True, exist_ok=True)
+RAW_DIR = settings.raw_dir
+OUT_DIR = settings.processed_dir
 
 def load_jsonl(path):
     with open(path, "r", encoding="utf-8") as f:
